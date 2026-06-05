@@ -162,6 +162,29 @@ function relTime(t) {
   return new Date(t).toLocaleDateString("sv-SE");
 }
 
+const SV_DAYS = ["söndag","måndag","tisdag","onsdag","torsdag","fredag","lördag"];
+const SV_MONTHS = ["januari","februari","mars","april","maj","juni","juli","augusti","september","oktober","november","december"];
+function fmtFullDate(t) {
+  const d = new Date(t);
+  const day = SV_DAYS[d.getDay()];
+  return `${day.charAt(0).toUpperCase()+day.slice(1)} ${d.getDate()} ${SV_MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+}
+function fmtTime(t) {
+  const d = new Date(t);
+  return `${String(d.getHours()).padStart(2,"0")}.${String(d.getMinutes()).padStart(2,"0")}`;
+}
+function fmtRelDay(t) {
+  const d = new Date(t); d.setHours(0,0,0,0);
+  const today = new Date(); today.setHours(0,0,0,0);
+  const days = Math.round((today - d) / (24*3600*1000));
+  if (days === 0) return "Idag";
+  if (days === 1) return "Igår";
+  if (days === 2) return "I förrgår";
+  if (days > 0 && days < 7) return `För ${days} dagar sedan`;
+  const dt = new Date(t);
+  return `${dt.getDate()} ${SV_MONTHS[dt.getMonth()]}`;
+}
+
 /* ─── GEMENSAMMA STILAR ────────────────────────────────────────────────────── */
 const inputStyle = {
   width:"100%", boxSizing:"border-box", height:"46px", borderRadius:"10px",
@@ -175,12 +198,13 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [items, setItems] = useState([]);
   const [history, setHistory] = useState([]);
+  const [completed, setCompleted] = useState([]);     // slutförda inventeringar
   const [email, setEmail] = useState("");
   const [who, setWho] = useState("");
   const [tab, setTab] = useState("dash");           // dash | inv | order | stats
   const [catFilter, setCatFilter] = useState("Alla");
   const [search, setSearch] = useState("");
-  const [modal, setModal] = useState(null);          // null | "product" | "settings" | "order"
+  const [modal, setModal] = useState(null);          // null | "product" | "settings" | "order" | "finish" | "viewInv" | "compareInv"
   const [editId, setEditId] = useState(null);
   const [form, setForm] = useState({});
   const [tmpEmail, setTmpEmail] = useState("");
@@ -190,11 +214,18 @@ export default function App() {
   const [sendResult, setSendResult] = useState(null);
   const [sendError, setSendError] = useState("");
   const [dbWarn, setDbWarn] = useState(false);
+  // Slutför inventering: formulär & visning
+  const [finishWho, setFinishWho] = useState("");
+  const [finishNote, setFinishNote] = useState("");
+  const [finishConfirmTime, setFinishConfirmTime] = useState(null); // datum/tid när popup öppnades
+  const [savedFlash, setSavedFlash] = useState(null); // success-meddelande på dashboard
+  const [viewInvId, setViewInvId] = useState(null);
 
   const sbRef = useRef(null);
   const saveRef = useRef(null);
   const itemsRef = useRef(items); useEffect(()=>{itemsRef.current=items;},[items]);
   const histRef = useRef(history); useEffect(()=>{histRef.current=history;},[history]);
+  const completedRef = useRef(completed); useEffect(()=>{completedRef.current=completed;},[completed]);
   const emailRef = useRef(email); useEffect(()=>{emailRef.current=email;},[email]);
   const whoRef = useRef(who); useEffect(()=>{whoRef.current=who;},[who]);
   const editStartRef = useRef({});
@@ -209,20 +240,21 @@ export default function App() {
       let state = null;
       try { state = await loadState(sbRef); } catch { setDbWarn(true); }
       if (cancelled) return;
-      let nextItems, nextHist = [], nextEmail = "", nextWho = "";
+      let nextItems, nextHist = [], nextEmail = "", nextWho = "", nextCompleted = [];
       if (state) {
         const migrated = migrateItems(state.items);
         nextItems = (migrated && migrated.length) ? migrated : DEFAULT_ITEMS;
         nextHist = Array.isArray(state.history) ? state.history : [];
         nextEmail = state.email || "";
         nextWho = state.inventoryName || "";
+        nextCompleted = Array.isArray(state.completedInventories) ? state.completedInventories : [];
       } else {
         nextItems = DEFAULT_ITEMS;
       }
-      setItems(nextItems); setHistory(nextHist); setEmail(nextEmail); setWho(nextWho);
+      setItems(nextItems); setHistory(nextHist); setEmail(nextEmail); setWho(nextWho); setCompleted(nextCompleted);
       setLoaded(true);
       // Skriv tillbaka i rensat dryckesformat
-      try { await saveState(sbRef, { items: nextItems, history: nextHist, email: nextEmail, inventoryName: nextWho }); } catch {}
+      try { await saveState(sbRef, { items: nextItems, history: nextHist, email: nextEmail, inventoryName: nextWho, completedInventories: nextCompleted }); } catch {}
     })();
     return () => { cancelled = true; };
   }, []);
@@ -244,6 +276,7 @@ export default function App() {
       history: partial.history ?? histRef.current,
       email: partial.email ?? emailRef.current,
       inventoryName: partial.inventoryName ?? whoRef.current,
+      completedInventories: partial.completedInventories ?? completedRef.current,
     };
     saveRef.current = setTimeout(() => { saveState(sbRef, snap).catch(()=>{}); }, 500);
   };
@@ -320,6 +353,50 @@ export default function App() {
     catch { const ta=document.createElement("textarea"); ta.value=text; document.body.appendChild(ta); ta.select(); try{document.execCommand("copy"); setCopyDone(true); setTimeout(()=>setCopyDone(false),2500);}catch{} document.body.removeChild(ta); }
   };
 
+  /* Slutför inventering */
+  const openFinish = () => {
+    setFinishWho((who||"").trim() ? who : "");
+    setFinishNote("");
+    setFinishConfirmTime(Date.now());
+    setModal("finish");
+  };
+  const completeInventory = () => {
+    // Bekräfta sista pågående historik-buntar innan ögonblicksbilden tas
+    if (histTimerRef.current) { clearTimeout(histTimerRef.current); histTimerRef.current = null; }
+    commitHistory();
+    const t = Date.now();
+    const snap = {
+      id: uid(),
+      t,
+      by: (finishWho||"").trim() || "Okänd",
+      note: (finishNote||"").trim(),
+      products: itemsRef.current.map(it => ({
+        id: it.id, name: it.name, category: it.category,
+        unit: it.unit, current: it.current, min: it.min,
+      })),
+    };
+    const nextCompleted = [snap, ...completedRef.current].slice(0, 100);
+    setCompleted(nextCompleted);
+    persist({ completedInventories: nextCompleted });
+    // Spara även namnet permanent om det ändrades
+    const newWho = (finishWho||"").trim();
+    if (newWho && newWho !== who) { setWho(newWho); persist({ inventoryName: newWho }); }
+    setModal(null);
+    setSavedFlash(snap);
+    setTimeout(() => setSavedFlash(null), 6000);
+    setTab("dash");
+  };
+  const openViewInv = (id) => { setViewInvId(id); setModal("viewInv"); };
+  const openCompareInv = (id) => { setViewInvId(id); setModal("compareInv"); };
+
+  const lastCompleted = completed[0] || null;
+  const viewedInv = useMemo(() => completed.find(c => c.id === viewInvId) || null, [completed, viewInvId]);
+  const prevInv = useMemo(() => {
+    if (!viewInvId) return null;
+    const idx = completed.findIndex(c => c.id === viewInvId);
+    return (idx >= 0 && idx+1 < completed.length) ? completed[idx+1] : null;
+  }, [completed, viewInvId]);
+
   /* Statistik (7 dagar) */
   const stats = useMemo(() => {
     const weekAgo = Date.now() - 7*24*3600*1000;
@@ -380,6 +457,38 @@ export default function App() {
         {/* ===== DASHBOARD ===== */}
         {tab === "dash" && (
           <div style={{display:"flex",flexDirection:"column",gap:"14px"}}>
+
+            {/* Success-meddelande efter slutförd inventering */}
+            {savedFlash && (
+              <div style={{background:"#047857",color:"#fff",borderRadius:"14px",padding:"16px",display:"flex",alignItems:"center",gap:"12px"}}>
+                <Check size={28} color="#fff" />
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:"15px",fontWeight:"700"}}>Inventeringen är sparad!</div>
+                  <div style={{fontSize:"13px",color:"#D1FAE5",marginTop:"2px"}}>
+                    {fmtFullDate(savedFlash.t)} kl {fmtTime(savedFlash.t)} · {savedFlash.products.length} produkter
+                  </div>
+                </div>
+                <button onClick={()=>setSavedFlash(null)} aria-label="Stäng" style={{background:"rgba(255,255,255,0.2)",border:"none",width:"32px",height:"32px",borderRadius:"8px",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",flexShrink:0}}>
+                  <X size={16} color="#fff" />
+                </button>
+              </div>
+            )}
+
+            {/* Senaste avstämning */}
+            {lastCompleted && !savedFlash && (
+              <div style={{background:"#fff",border:`1px solid ${C.line}`,borderRadius:"14px",padding:"13px 15px",display:"flex",alignItems:"center",gap:"12px"}}>
+                <div style={{width:"40px",height:"40px",borderRadius:"10px",background:"#ECFDF5",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                  <Clock size={20} color="#059669" />
+                </div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:"12px",color:C.sub,fontWeight:"600",textTransform:"uppercase",letterSpacing:"0.5px"}}>Senaste avstämning</div>
+                  <div style={{fontSize:"15px",color:C.ink,fontWeight:"600",marginTop:"2px"}}>
+                    {fmtRelDay(lastCompleted.t)} kl {fmtTime(lastCompleted.t)}
+                  </div>
+                  <div style={{fontSize:"12px",color:C.sub,marginTop:"1px"}}>av {lastCompleted.by}</div>
+                </div>
+              </div>
+            )}
 
             {/* Notifiering */}
             {orderItems.length > 0 ? (
@@ -452,6 +561,21 @@ export default function App() {
         {/* ===== INVENTERING ===== */}
         {tab === "inv" && (
           <div>
+            {/* Stor "Slutför inventering"-knapp */}
+            <button onClick={openFinish}
+              style={{width:"100%",minHeight:"66px",background:"#047857",color:"#fff",border:"none",
+                borderRadius:"14px",fontSize:"17px",fontWeight:"700",fontFamily:"inherit",cursor:"pointer",
+                display:"flex",alignItems:"center",justifyContent:"center",gap:"12px",marginBottom:"12px",
+                boxShadow:"0 4px 14px rgba(4,120,87,0.28)",padding:"12px 16px"}}>
+              <Check size={26} color="#fff" />
+              <span>Slutför inventering</span>
+            </button>
+            {lastCompleted && (
+              <div style={{fontSize:"13px",color:C.sub,textAlign:"center",margin:"-4px 2px 12px"}}>
+                Senast: {fmtRelDay(lastCompleted.t)} kl {fmtTime(lastCompleted.t)} av {lastCompleted.by}
+              </div>
+            )}
+
             {/* Sök + lägg till */}
             <div style={{display:"flex",gap:"8px",marginBottom:"10px"}}>
               <div style={{flex:1,position:"relative"}}>
@@ -549,10 +673,38 @@ export default function App() {
               <Chart size={22} color={C.ink} />
               <div style={{fontSize:"18px",fontWeight:"700",color:C.ink}}>Statistik</div>
             </div>
-            <div style={{fontSize:"13px",color:C.sub,display:"flex",alignItems:"center",gap:"6px",margin:"-6px 2px 0"}}>
-              <Clock size={14} color={C.faint} />
-              Senaste inventering: {stats.lastAt ? relTime(stats.lastAt) : "—"}
-            </div>
+
+            {/* Slutförda inventeringar */}
+            <Panel title="Slutförda inventeringar" icon={<Check size={16} color={C.sub} />}>
+              {completed.length === 0 ? (
+                <Empty text="Du har inte slutfört någon inventering ännu. Tryck på den gröna knappen ’Slutför inventering’ på fliken Inventering när du är klar med en räkning, så sparas den här." />
+              ) : (
+                <div>
+                  {completed.slice(0,10).map((c,i) => (
+                    <button key={c.id} onClick={()=>openViewInv(c.id)}
+                      style={{width:"100%",textAlign:"left",background:"none",border:"none",borderBottom:i<Math.min(completed.length,10)-1?`1px solid #F1F5F9`:"none",padding:"12px 0",cursor:"pointer",display:"flex",alignItems:"center",gap:"12px",fontFamily:"inherit"}}>
+                      <div style={{width:"42px",height:"42px",borderRadius:"10px",background:"#ECFDF5",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                        <Check size={20} color="#059669" />
+                      </div>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:"15px",fontWeight:"600",color:C.ink}}>
+                          {fmtRelDay(c.t)} <span style={{color:C.sub,fontWeight:"500"}}>kl {fmtTime(c.t)}</span>
+                        </div>
+                        <div style={{fontSize:"13px",color:C.sub,marginTop:"1px"}}>
+                          {c.products.length} produkter · av {c.by}{c.note?" · har anteckning":""}
+                        </div>
+                      </div>
+                      <Chevron size={16} color={C.faint} />
+                    </button>
+                  ))}
+                  {completed.length > 10 && (
+                    <div style={{fontSize:"12px",color:C.faint,textAlign:"center",padding:"8px 0 0"}}>+ {completed.length-10} äldre</div>
+                  )}
+                </div>
+              )}
+            </Panel>
+
+            <div style={{fontSize:"13px",color:C.sub,fontWeight:"600",margin:"6px 2px -4px",textTransform:"uppercase",letterSpacing:"0.6px"}}>Veckostatistik (7 dagar)</div>
 
             {/* Mest förbrukade */}
             <Panel title="Mest förbrukade (7 dagar)" icon={<Trend size={16} color={C.sub} />}>
@@ -720,6 +872,176 @@ export default function App() {
           <button onClick={copyOrder} style={{width:"100%",height:"46px",border:`1.5px solid ${C.line}`,borderRadius:"10px",background: copyDone?"#ECFDF5":"#fff",color: copyDone?"#047857":"#334155",cursor:"pointer",fontFamily:"inherit",fontSize:"15px",fontWeight:"500",display:"flex",alignItems:"center",justifyContent:"center",gap:"8px"}}>
             {copyDone ? <Check size={17} color="#059669" /> : <Clipboard size={17} color="#334155" />} {copyDone ? "Kopierad! Klistra in i mejl/SMS" : "Kopiera lista"}
           </button>
+        </Modal>
+      )}
+
+      {/* ===== MODAL: BEKRÄFTA SLUTFÖR INVENTERING ===== */}
+      {modal === "finish" && (
+        <Modal onClose={()=>setModal(null)}>
+          <Head title="Slutför inventering?" onClose={()=>setModal(null)} />
+
+          {/* Stort datumkort */}
+          <div style={{background:"#ECFDF5",border:"1.5px solid #A7F3D0",borderRadius:"14px",padding:"18px",textAlign:"center",marginBottom:"16px"}}>
+            <div style={{fontSize:"12px",color:"#047857",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.6px",marginBottom:"4px"}}>Dagens datum</div>
+            <div style={{fontSize:"19px",color:"#064E3B",fontWeight:"700",lineHeight:1.3}}>
+              {finishConfirmTime ? fmtFullDate(finishConfirmTime) : ""}
+            </div>
+            <div style={{fontSize:"15px",color:"#047857",marginTop:"4px"}}>
+              klockan {finishConfirmTime ? fmtTime(finishConfirmTime) : ""}
+            </div>
+          </div>
+
+          <div style={{fontSize:"15px",color:C.ink,lineHeight:1.5,marginBottom:"16px"}}>
+            <strong>{items.length} produkter</strong> kommer sparas i en rapport. Du kan se rapporten senare under fliken <strong>Statistik</strong>.
+          </div>
+
+          <Field label="Vem har inventerat?">
+            <input value={finishWho} onChange={e=>setFinishWho(e.target.value)} placeholder="Ditt namn"
+              style={{...inputStyle,fontSize:"16px",height:"50px"}} autoFocus />
+          </Field>
+
+          <Field label="Anteckning (valfritt)">
+            <textarea value={finishNote} onChange={e=>setFinishNote(e.target.value)} placeholder="t.ex. ’Veckoinventering fredag’"
+              rows={2}
+              style={{...inputStyle,height:"auto",padding:"10px 12px",fontSize:"15px",resize:"none"}} />
+          </Field>
+
+          <div style={{display:"flex",flexDirection:"column",gap:"8px",marginTop:"6px"}}>
+            <button onClick={completeInventory} disabled={!finishWho.trim()}
+              style={{width:"100%",minHeight:"56px",border:"none",borderRadius:"12px",
+                background: finishWho.trim() ? "#047857" : "#A7F3D0",
+                color:"#fff",cursor: finishWho.trim()?"pointer":"not-allowed",
+                fontFamily:"inherit",fontSize:"17px",fontWeight:"700",
+                display:"flex",alignItems:"center",justifyContent:"center",gap:"10px",padding:"12px 16px"}}>
+              <Check size={22} color="#fff" />
+              Ja, slutför inventering
+            </button>
+            <button onClick={()=>setModal(null)}
+              style={{width:"100%",minHeight:"50px",border:`1.5px solid ${C.line}`,borderRadius:"12px",background:"#fff",color:C.sub,cursor:"pointer",fontFamily:"inherit",fontSize:"15px",fontWeight:"600"}}>
+              Avbryt
+            </button>
+          </div>
+
+          {!finishWho.trim() && (
+            <div style={{fontSize:"12px",color:C.faint,textAlign:"center",marginTop:"10px"}}>
+              Skriv ditt namn för att kunna slutföra.
+            </div>
+          )}
+        </Modal>
+      )}
+
+      {/* ===== MODAL: VISA SLUTFÖRD INVENTERING ===== */}
+      {modal === "viewInv" && viewedInv && (
+        <Modal onClose={()=>setModal(null)}>
+          <Head title="Inventeringsrapport" onClose={()=>setModal(null)} />
+          <div style={{background:"#F8FAFC",border:`1px solid ${C.line}`,borderRadius:"12px",padding:"14px 16px",marginBottom:"14px"}}>
+            <div style={{fontSize:"16px",color:C.ink,fontWeight:"700"}}>{fmtFullDate(viewedInv.t)}</div>
+            <div style={{fontSize:"14px",color:C.sub,marginTop:"2px"}}>klockan {fmtTime(viewedInv.t)} · av {viewedInv.by}</div>
+            {viewedInv.note && <div style={{fontSize:"14px",color:C.ink,marginTop:"8px",fontStyle:"italic"}}>”{viewedInv.note}”</div>}
+            <div style={{fontSize:"13px",color:C.sub,marginTop:"8px"}}>{viewedInv.products.length} produkter inventerades</div>
+          </div>
+
+          {prevInv && (
+            <button onClick={()=>setModal("compareInv")}
+              style={{width:"100%",minHeight:"50px",border:"none",borderRadius:"11px",background:C.ink,color:"#fff",cursor:"pointer",fontFamily:"inherit",fontSize:"15px",fontWeight:"600",display:"flex",alignItems:"center",justifyContent:"center",gap:"8px",marginBottom:"14px"}}>
+              <Trend size={17} color="#fff" /> Jämför med föregående ({fmtRelDay(prevInv.t)})
+            </button>
+          )}
+
+          <div style={{fontSize:"12px",color:C.sub,fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.6px",marginBottom:"8px"}}>Produkter</div>
+          <div style={{background:"#fff",border:`1px solid ${C.line}`,borderRadius:"12px",overflow:"hidden"}}>
+            {CATEGORIES.map(cat => {
+              const ci = viewedInv.products.filter(p => p.category === cat);
+              if (!ci.length) return null;
+              return (
+                <div key={cat}>
+                  <div style={{padding:"8px 14px",background:"#F8FAFC",borderBottom:`1px solid ${C.line}`,fontSize:"11px",fontWeight:"700",color:C.sub,textTransform:"uppercase",letterSpacing:"0.6px"}}>{cat}</div>
+                  {ci.map((p,i) => {
+                    const s = STATUS[getStatus(p.current,p.min)];
+                    return (
+                      <div key={p.id} style={{padding:"10px 14px",borderBottom:i<ci.length-1?`1px solid #F1F5F9`:"none",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <div style={{minWidth:0,paddingRight:"8px"}}>
+                          <div style={{fontSize:"14px",color:C.ink,fontWeight:"500"}}>{p.name}</div>
+                          <div style={{fontSize:"12px",color:C.faint}}>min {p.min} {p.unit}</div>
+                        </div>
+                        <div style={{display:"flex",alignItems:"center",gap:"8px",flexShrink:0}}>
+                          <span style={{fontSize:"16px",fontWeight:"700",color:C.ink}}>{p.current}</span>
+                          <span style={{fontSize:"12px",color:C.sub}}>{p.unit}</span>
+                          <span style={{width:"9px",height:"9px",borderRadius:"50%",background:s.dot}} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        </Modal>
+      )}
+
+      {/* ===== MODAL: JÄMFÖR INVENTERINGAR ===== */}
+      {modal === "compareInv" && viewedInv && prevInv && (
+        <Modal onClose={()=>setModal("viewInv")}>
+          <Head title="Förbrukning sedan föregående" onClose={()=>setModal("viewInv")} />
+          <div style={{fontSize:"13px",color:C.sub,marginBottom:"14px",lineHeight:1.5}}>
+            Från <strong style={{color:C.ink}}>{fmtRelDay(prevInv.t)} kl {fmtTime(prevInv.t)}</strong> till <strong style={{color:C.ink}}>{fmtRelDay(viewedInv.t)} kl {fmtTime(viewedInv.t)}</strong>
+          </div>
+          {(() => {
+            // Bygg diff per produkt-id
+            const prevMap = new Map(prevInv.products.map(p => [p.id, p]));
+            const rows = viewedInv.products.map(p => {
+              const old = prevMap.get(p.id);
+              const oldVal = old ? old.current : null;
+              const delta = old ? p.current - old.current : null;
+              return { p, oldVal, delta, newProduct: !old };
+            }).sort((a,b) => {
+              // Mest förbrukade först (mest negativa delta), sen nyinkomna, sen oförändrade
+              const da = a.delta == null ? 1 : a.delta;
+              const db = b.delta == null ? 1 : b.delta;
+              return da - db;
+            });
+            const consumed = rows.filter(r => r.delta != null && r.delta < 0);
+            const added = rows.filter(r => r.delta != null && r.delta > 0);
+            return (
+              <>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"14px"}}>
+                  <div style={{background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:"12px",padding:"12px 14px",textAlign:"center"}}>
+                    <div style={{fontSize:"12px",color:"#991B1B",fontWeight:"600"}}>Förbrukade produkter</div>
+                    <div style={{fontSize:"24px",color:"#B91C1C",fontWeight:"800",marginTop:"2px"}}>{consumed.length}</div>
+                  </div>
+                  <div style={{background:"#ECFDF5",border:"1px solid #A7F3D0",borderRadius:"12px",padding:"12px 14px",textAlign:"center"}}>
+                    <div style={{fontSize:"12px",color:"#065F46",fontWeight:"600"}}>Påfyllda produkter</div>
+                    <div style={{fontSize:"24px",color:"#047857",fontWeight:"800",marginTop:"2px"}}>{added.length}</div>
+                  </div>
+                </div>
+                <div style={{background:"#fff",border:`1px solid ${C.line}`,borderRadius:"12px",overflow:"hidden"}}>
+                  {rows.filter(r => r.delta !== 0 || r.newProduct).map((r,i,arr) => (
+                    <div key={r.p.id} style={{padding:"11px 14px",borderBottom:i<arr.length-1?`1px solid #F1F5F9`:"none",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <div style={{minWidth:0,paddingRight:"8px"}}>
+                        <div style={{fontSize:"14px",color:C.ink,fontWeight:"500"}}>{r.p.name}</div>
+                        <div style={{fontSize:"12px",color:C.faint}}>{r.p.category}</div>
+                      </div>
+                      <div style={{textAlign:"right",flexShrink:0}}>
+                        {r.newProduct ? (
+                          <span style={{fontSize:"12px",color:"#047857",fontWeight:"600",background:"#ECFDF5",border:"1px solid #A7F3D0",padding:"3px 8px",borderRadius:"12px"}}>Ny produkt</span>
+                        ) : (
+                          <>
+                            <div style={{fontSize:"15px",fontWeight:"700",color: r.delta < 0 ? "#B91C1C" : r.delta > 0 ? "#047857" : C.sub}}>
+                              {r.delta > 0 ? "+" : ""}{r.delta} {r.p.unit}
+                            </div>
+                            <div style={{fontSize:"11px",color:C.faint,marginTop:"1px"}}>{r.oldVal} → {r.p.current}</div>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {rows.filter(r => r.delta !== 0 || r.newProduct).length === 0 && (
+                    <div style={{padding:"24px",textAlign:"center",fontSize:"13px",color:C.faint}}>Inga förändringar mellan dessa två inventeringar.</div>
+                  )}
+                </div>
+              </>
+            );
+          })()}
         </Modal>
       )}
     </div>
